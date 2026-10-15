@@ -20,3 +20,16 @@ SELECT country.iso_code FROM geoip WHERE ip = toIPv4('8.8.8.8');
 The engine supports IPv4 and IPv6 lookups using bounded equality and `IN` predicates; unbounded scans are unsupported. The schema can be declared manually or inferred automatically from the MMDB records. Nested maps become named `Tuple` values, and supported arrays, scalar types, and nullable fields can be queried.
 
 The file must be inside the server's `user_files_path`; creating a table requires `READ ON FILE`. The `refresh_interval` setting controls how frequently local file replacements are checked. Set it to `'0'` to disable automatic checks. Atomically rename a new file over the existing source to avoid mutating the active memory mapping. Existing queries keep their pinned mapping, and an incompatible replacement is rejected.
+
+## Direct JOIN and optimized lookup
+
+Direct key-value access supports `LEFT ANY JOIN` using `join_algorithm = 'direct'`. Joins pin an immutable database generation throughout the operation, even if a local file is refreshed.
+
+```sql
+SELECT logs.client_ip, geoip.country.iso_code
+FROM reverse_proxy_logs AS logs
+LEFT ANY JOIN geoip ON logs.client_ip = geoip.ip
+SETTINGS join_algorithm = 'direct';
+```
+
+The virtual `_mmdb_metadata` column exposes the MMDB metadata header and is excluded from `SELECT *`. Projections can select individual nested fields. Bounded per-reader caches reuse decoded records and shared arrays/maps/tuples across lookups, while retaining the original longest-prefix matching behavior.

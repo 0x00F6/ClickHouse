@@ -42,6 +42,11 @@ query "CREATE TABLE ${table}_v6 ENGINE = MaxMindDB('$relative/v6_A.mmdb') SETTIN
 query "SELECT ip, country.iso_code, bool FROM ${table}_v6 WHERE ip IN (toIPv6('2001:db8::1'), toIPv6('2001:db8:1::1'), toIPv6('::8.8.8.8'), toIPv6('::ffff:8.8.8.8')) ORDER BY ip"
 query "CREATE TABLE ${table}_v4_in_v6 (ip IPv4, version String) ENGINE = MaxMindDB('$relative/v6_A.mmdb') SETTINGS refresh_interval='0'"
 query "SELECT ip, version FROM ${table}_v4_in_v6 WHERE ip=toIPv4('8.8.8.8')"
+query "SELECT l.ip, r.version FROM (SELECT arrayJoin([toIPv4('8.8.8.8'), toIPv4('9.9.9.9')]) AS ip) AS l LEFT ANY JOIN $table AS r USING ip ORDER BY l.ip SETTINGS join_algorithm='direct', enable_parallel_replicas=0"
+query "SELECT l.ip, r.version FROM (SELECT arrayJoin([toNullable(toIPv4('8.8.8.8')), NULL]) AS ip) AS l LEFT ANY JOIN $table AS r USING ip ORDER BY l.ip SETTINGS join_algorithm='direct', enable_parallel_replicas=0, join_use_nulls=1"
+query "CREATE TABLE ${table}_probe (ip IPv4, arr Array(UInt8)) ENGINE=MergeTree ORDER BY tuple() SETTINGS ratio_of_defaults_for_sparse_serialization=0; INSERT INTO ${table}_probe VALUES ('8.8.8.8', [1,2]), ('0.0.0.0', [3])"
+query "SELECT count(), countIf(r.version='A'), countIf(r.version='') FROM (SELECT ip FROM ${table}_probe ARRAY JOIN arr) AS l LEFT ANY JOIN $table AS r USING ip SETTINGS join_algorithm='direct', enable_parallel_replicas=0, enable_lazy_columns_replication=1"
+
 expect_error()
 {
     local code="$1"
@@ -93,10 +98,48 @@ else:
 PY
 }
 
-# Validate local hot reload independently of Direct JOIN.
+# Backpressure keeps a `Direct JOIN` alive while another query observes the new generation.
+pipe_dir="$CLICKHOUSE_TMP/${CLICKHOUSE_TEST_UNIQUE_NAME}_pipes"
+mkdir -p "$pipe_dir"
+mkfifo "$pipe_dir/output" "$pipe_dir/release"
+python3 - "$pipe_dir" <<'PY' &
+import pathlib
+import sys
+directory = pathlib.Path(sys.argv[1])
+with (directory / 'output').open() as stream:
+    assert stream.readline().strip() == 'A' * 256
+    (directory / 'ready').touch()
+    with (directory / 'release').open('rb') as release:
+        release.read(1)
+    for line in stream:
+        assert line.strip() == 'A' * 256
+print('Pinned join generation A')
+PY
+reader_pid=$!
+lookup_id="${CLICKHOUSE_TEST_UNIQUE_NAME}_pinned"
+$CLICKHOUSE_CLIENT --compression 0 --allow_experimental_maxminddb_table_engine 1 --query_id "$lookup_id" -q "SELECT repeat(r.version, 256) FROM (SELECT toIPv4(134744064 + number % 256) AS ip FROM numbers(100000)) AS l LEFT ANY JOIN $table AS r USING ip SETTINGS join_algorithm='direct', enable_parallel_replicas=0, max_block_size=1024, max_threads=1 FORMAT TSV" > "$pipe_dir/output" &
+lookup_pid=$!
+python3 - "$pipe_dir/ready" <<'PY'
+import pathlib
+import sys
+import time
+deadline = time.monotonic() + 30
+while not pathlib.Path(sys.argv[1]).exists():
+    if time.monotonic() > deadline:
+        raise RuntimeError('Concurrent lookup did not produce its first row')
+PY
+[[ $(query "SELECT count() FROM system.processes WHERE query_id='$lookup_id'") == 1 ]]
+
+# Atomic replacement must leave the mapped old inode readable by existing readers.
 cp "$CLICKHOUSE_USER_FILES_UNIQUE/v4_B.mmdb" "$CLICKHOUSE_USER_FILES_UNIQUE/next.mmdb"
 mv "$CLICKHOUSE_USER_FILES_UNIQUE/next.mmdb" "$CLICKHOUSE_USER_FILES_UNIQUE/current.mmdb"
 wait_version B
+printf x > "$pipe_dir/release"
+wait "$reader_pid"
+wait "$lookup_pid"
+reader_pid=''
+lookup_pid=''
+rm -rf "$pipe_dir"
 
 # A failed generation must not publish a new schema or replace valid data.
 started=$(query 'SELECT toUnixTimestamp(now())')

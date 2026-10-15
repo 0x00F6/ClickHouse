@@ -31,6 +31,11 @@ FR	France	2.25
 2001:db8::1	FR	true
 2001:db8:1::1	\N	false
 8.8.8.8	A
+8.8.8.8	A
+9.9.9.9	
+8.8.8.8	A
+\N	\N
+3	2	1
 Error 36
 Error 36
 Error 36
@@ -51,6 +56,7 @@ Duration 5m
 Duration 10m
 Duration 20h
 Generation B
+Pinned join generation A
 B
 Generation A
 Generation B

@@ -6,7 +6,9 @@
 
 #include <maxminddb.h>
 
+#include <array>
 #include <functional>
+#include <optional>
 #include <string_view>
 
 namespace DB
@@ -52,7 +54,14 @@ public:
 private:
     struct Column;
     std::vector<std::unique_ptr<Column>> projections;
-
+    struct CachedRecord
+    {
+        UInt32 offset;
+        size_t row;
+    };
+    std::array<CachedRecord, 128> records{};
+    std::optional<size_t> first_projection;
+    bool reuse_records = false;
 };
 
 using MaxMindDBGenerationPtr = std::shared_ptr<const MaxMindDBGeneration>;

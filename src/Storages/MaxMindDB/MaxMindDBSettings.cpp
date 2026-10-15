@@ -21,7 +21,9 @@ extern const MaxMindDBSettingsString refresh_interval;
 
 // clang-format off
 #define LIST_OF_MAXMINDDB_SETTINGS(DECLARE, ALIAS) \
-    DECLARE(String, refresh_interval, "5m", "Interval between checks for a new MMDB generation, using duration syntax such as `5m`, `10m`, or `20h`. `0` disables automatic refresh.", 0)
+    DECLARE(String, refresh_interval, "5m", "Interval between checks for a new MMDB generation, using duration syntax such as `5m`, `10m`, or `20h`. `0` disables automatic refresh.", 0) \
+    DECLARE(String, disk, "default", "Local disk used to cache remote MMDB files. The disk must support direct access to unencrypted local files.", 0) \
+    DECLARE(UInt64, max_download_size, 1073741824, "Maximum download size and total uncompressed archive entry size in bytes. `0` means unlimited.", 0)
 // clang-format on
 
 DECLARE_SETTINGS_TRAITS(MaxMindDBSettingsTraits, LIST_OF_MAXMINDDB_SETTINGS, MAXMINDDB_SETTINGS_SUPPORTED_TYPES)

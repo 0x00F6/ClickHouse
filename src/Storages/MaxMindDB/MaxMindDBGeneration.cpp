@@ -19,10 +19,12 @@
 #include <DataTypes/getLeastSupertype.h>
 #include <base/scope_guard.h>
 #include <Common/Exception.h>
+#include <Common/HashTable/Hash.h>
 #include <Common/UnorderedSetWithMemoryTracking.h>
 #include <Common/assert_cast.h>
 #include <Common/checkStackSize.h>
 
+#include <array>
 #include <limits>
 
 namespace DB
@@ -416,6 +418,14 @@ struct MaxMindDBColumnDecoder::Column
     std::vector<const char *> path_pointers;
     String extract_subcolumn;
     ValueDecoder decoder;
+    struct CachedValue
+    {
+        UInt32 offset;
+        size_t row;
+    };
+    std::array<CachedValue, 128> cache{};
+    bool use_cache = false;
+
     explicit Column(const NameAndTypePair & column)
         : description(column)
         , decoder(column.type)
@@ -454,12 +464,34 @@ struct MaxMindDBColumnDecoder::Column
         path_pointers.push_back(nullptr);
     }
 
+    void startBlock(size_t rows)
+    {
+        const auto kind = removeNullable(decoder.type)->getTypeId();
+        use_cache = rows >= cache.size() && (kind == TypeIndex::Tuple || kind == TypeIndex::Map || kind == TypeIndex::Array);
+        if (use_cache)
+            for (auto & value : cache)
+                value.row = std::numeric_limits<size_t>::max();
+    }
+
     void append(MMDB_entry_s entry, IColumn & column)
     {
         MMDB_entry_data_s data{};
         const auto status = MMDB_aget_value(&entry, &data, path_pointers.data());
         if (status != MMDB_LOOKUP_PATH_DOES_NOT_MATCH_DATA_ERROR)
             checkMMDB(status);
+        CachedValue * cached = nullptr;
+        if (use_cache && data.has_data)
+        {
+            /// Shared MMDB subtrees can belong to different IP records. Reuse an already decoded row
+            /// within this block; `IColumn` owns the copied result and the generation remains pinned.
+            cached = &cache[intHash32<0>(data.offset) & (cache.size() - 1)];
+            if (cached->row != std::numeric_limits<size_t>::max() && cached->offset == data.offset)
+            {
+                column.insertFrom(column, cached->row);
+                return;
+            }
+        }
+        const auto row = column.size();
         if (extract_subcolumn.empty())
         {
             if (data.has_data)
@@ -477,6 +509,8 @@ struct MaxMindDBColumnDecoder::Column
             const auto extracted = decoder.type->getSubcolumn(extract_subcolumn, std::move(root));
             column.insertFrom(*extracted, 0);
         }
+        if (cached)
+            *cached = {data.offset, row};
     }
 };
 
@@ -485,6 +519,8 @@ MaxMindDBColumnDecoder::MaxMindDBColumnDecoder(const NamesAndTypesList & columns
     projections.reserve(columns.size());
     for (const auto & column : columns)
     {
+        if (!first_projection && column.name != "ip" && !MaxMindDBGeneration::isMetadataColumn(column.name))
+            first_projection = projections.size();
         projections.push_back(
             column.name == "ip" || MaxMindDBGeneration::isMetadataColumn(column.name) ? nullptr : std::make_unique<Column>(column));
     }
@@ -492,13 +528,40 @@ MaxMindDBColumnDecoder::MaxMindDBColumnDecoder(const NamesAndTypesList & columns
 
 MaxMindDBColumnDecoder::~MaxMindDBColumnDecoder() = default;
 
-void MaxMindDBColumnDecoder::startBlock(size_t) {}
+void MaxMindDBColumnDecoder::startBlock(size_t rows)
+{
+    reuse_records = first_projection.has_value() && rows >= records.size();
+    if (reuse_records)
+        for (auto & record : records)
+            record.row = std::numeric_limits<size_t>::max();
+    for (const auto & projection : projections)
+        if (projection)
+            projection->startBlock(rows);
+}
 
 void MaxMindDBColumnDecoder::append(MMDB_entry_s entry, MutableColumns & columns)
 {
+    CachedRecord * cached = nullptr;
+    size_t row = 0;
+    if (reuse_records)
+    {
+        /// Different lookup keys can resolve to the same record by longest-prefix matching.
+        /// Row indexes stay valid across column reallocations, and are discarded at every block.
+        cached = &records[intHash32<0>(entry.offset) & (records.size() - 1)];
+        if (cached->row != std::numeric_limits<size_t>::max() && cached->offset == entry.offset)
+        {
+            for (size_t i = 0; i < projections.size(); ++i)
+                if (projections[i])
+                    columns[i]->insertFrom(*columns[i], cached->row);
+            return;
+        }
+        row = columns[*first_projection]->size();
+    }
     for (size_t i = 0; i < projections.size(); ++i)
         if (projections[i])
             projections[i]->append(entry, *columns[i]);
+    if (cached)
+        *cached = {entry.offset, row};
 }
 
 Block MaxMindDBColumnDecoder::sampleBlock() const

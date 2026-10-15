@@ -7,6 +7,7 @@
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeNullable.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/castColumn.h>
 #include <Parsers/ASTCreateQuery.h>
 #include <Parsers/ASTIdentifier.h>
 #include <Processors/ISource.h>
@@ -192,6 +193,58 @@ private:
     size_t position;
     size_t end;
     size_t max_block_size;
+};
+
+class MaxMindDBLookupSnapshot final : public IKeyValueEntity
+{
+public:
+    MaxMindDBLookupSnapshot(MaxMindDBGenerationPtr generation_, ColumnsDescription columns_)
+        : generation(std::move(generation_))
+        , columns(std::move(columns_))
+    {
+        lookup_columns = columns;
+        lookup_columns.add({MaxMindDBGeneration::metadata_column_name, MaxMindDBGeneration::getMetadataType()});
+    }
+
+    Names getPrimaryKey() const override { return {"ip"}; }
+
+    Block getSampleBlock(const Names & required_columns) const override
+    {
+        Block result;
+        const auto names = required_columns.empty()
+            ? lookup_columns.get(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns()).getNames()
+            : required_columns;
+        for (const auto & column : lookup_columns.getByNames(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), names))
+            result.insert({column.type->createColumn(), column.type, column.name});
+        return result;
+    }
+
+    Chunk getByKeys(
+        const ColumnsWithTypeAndName & keys,
+        const Names & required_columns,
+        PaddedPODArray<UInt8> & out_null_map,
+        IColumn::Offsets & out_offsets) const override
+    {
+        if (keys.size() != 1)
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "MaxMindDB lookup requires one IP key column");
+        out_offsets.clear();
+        const auto names = required_columns.empty()
+            ? lookup_columns.get(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns()).getNames()
+            : required_columns;
+        const auto requested = lookup_columns.getByNames(GetColumnsOptions(GetColumnsOptions::All).withSubcolumns(), names);
+        const auto key_type = columns.getPhysical("ip").type;
+        auto converted = removeNullable(keys.front().type)->equals(*key_type)
+            ? keys.front().column->convertToFullIfWrapped()
+            : castColumn(keys.front(), makeNullable(key_type))->convertToFullIfWrapped();
+        out_null_map.resize(converted->size());
+        LookupReader reader(generation, requested, key_type->getTypeId());
+        return reader.read(*converted, 0, converted->size(), &out_null_map);
+    }
+
+private:
+    MaxMindDBGenerationPtr generation;
+    ColumnsDescription columns;
+    ColumnsDescription lookup_columns;
 };
 
 class ReadFromMaxMindDB final : public SourceStepWithFilter
@@ -387,6 +440,26 @@ void StorageMaxMindDB::read(
         std::make_unique<ReadFromMaxMindDB>(header, column_names, query_info, snapshot, query_context, max_block_size, num_streams));
 }
 
+Block StorageMaxMindDB::getSampleBlock(const Names & required_columns) const
+{
+    return getLookupSnapshot()->getSampleBlock(required_columns);
+}
+
+Chunk StorageMaxMindDB::getByKeys(
+    const ColumnsWithTypeAndName & keys,
+    const Names & required_columns,
+    PaddedPODArray<UInt8> & out_null_map,
+    IColumn::Offsets & out_offsets) const
+{
+    return getLookupSnapshot()->getByKeys(keys, required_columns, out_null_map, out_offsets);
+}
+
+std::shared_ptr<const IKeyValueEntity> StorageMaxMindDB::getLookupSnapshot() const
+{
+    const auto metadata = getInMemoryMetadataPtr(getContext(), false);
+    return std::make_shared<MaxMindDBLookupSnapshot>(generation.get(), metadata->columns);
+}
+
 void registerStorageMaxMindDB(StorageFactory & factory);
 void registerStorageMaxMindDB(StorageFactory & factory)
 {
@@ -443,6 +516,18 @@ SELECT country.iso_code FROM geoip WHERE ip = toIPv4('8.8.8.8');
 The engine accepts manual schemas or infers types from MMDB records. The `ip` column must be IPv4 or IPv6, and bounded `ip = ...` or `ip IN (...)` predicates are required. Unbounded scans are unsupported. Local sources require READ ON FILE and must be inside the server's `user_files_path`.
 
 `refresh_interval` controls checks for local file replacements (`'0'` disables checking). Updates should atomically replace the source. A new generation must validate against the persisted schema before publication.
+
+## Direct joins and performance
+
+The engine implements `IKeyValueEntity` and supports `LEFT ANY JOIN` with `join_algorithm = 'direct'`. A pinned generation is used for the duration of the join.
+
+```sql
+SELECT l.ip, geoip.country.iso_code
+FROM logs AS l LEFT ANY JOIN geoip ON l.ip = geoip.ip
+SETTINGS join_algorithm = 'direct';
+```
+
+The virtual `_mmdb_metadata` column exposes database header fields. Projection-aware lookups decode selected nested values only. Bounded per-reader caches reuse decoded records and shared container subtrees when MMDB offsets repeat.
 )DOCS_MD",
             .syntax = "ENGINE = MaxMindDB(local_mmdb_path)",
             .related = {"File", "EmbeddedRocksDB"},

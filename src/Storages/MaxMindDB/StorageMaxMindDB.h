@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Core/BackgroundSchedulePoolTaskHolder.h>
+#include <Interpreters/IKeyValueEntity.h>
 #include <Storages/IStorage.h>
 #include <Storages/MaxMindDB/MaxMindDBGeneration.h>
 #include <Storages/MaxMindDB/MaxMindDBSettings.h>
@@ -8,7 +9,7 @@
 
 namespace DB
 {
-class StorageMaxMindDB final : public IStorage, public WithContext
+class StorageMaxMindDB final : public IStorage, public IKeyValueEntity, public WithContext
 {
 public:
     StorageMaxMindDB(
@@ -39,6 +40,15 @@ public:
         QueryProcessingStage::Enum,
         size_t max_block_size,
         size_t num_streams) override;
+
+    Names getPrimaryKey() const override { return {"ip"}; }
+    std::shared_ptr<const IKeyValueEntity> getLookupSnapshot() const override;
+    Chunk getByKeys(
+        const ColumnsWithTypeAndName & keys,
+        const Names & required_columns,
+        PaddedPODArray<UInt8> & out_null_map,
+        IColumn::Offsets & out_offsets) const override;
+    Block getSampleBlock(const Names & required_columns) const override;
 
 private:
     void refresh();
